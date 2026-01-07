@@ -53,6 +53,33 @@ def make_eth_header(dst: bytes, src: bytes, ethertype: int) -> bytes:
     return dst + src + struct.pack('!H', ethertype)
 
 
+def _ip_checksum(header: bytes) -> int:
+    """计算 IPv4 首部校验和"""
+    if len(header) % 2 == 1:
+        header = header + b'\x00'
+    total = 0
+    for i in range(0, len(header), 2):
+        total += (header[i] << 8) + header[i + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def _build_tcp_header(src_port: int, dst_port: int) -> bytes:
+    """构建 TCP 头部 (20 bytes，无选项)"""
+    seq_num = random.randint(0, 0xFFFFFFFF)
+    ack_num = 0
+    data_offset = 5  # 20 bytes / 4 = 5
+    flags = 0x02  # SYN
+    window = 65535
+    checksum = 0  # 简化处理
+    urgent = 0
+    offset_flags = (data_offset << 12) | flags
+    return struct.pack('!HHIIHHHH',
+                       src_port, dst_port, seq_num, ack_num,
+                       offset_flags, window, checksum, urgent)
+
+
 def build_payload(payload_type: str, length: int, extra: Optional[dict] = None) -> bytes:
     """根据类型构造净荷（返回原始 bytes，不包含以太头）
 
@@ -61,29 +88,53 @@ def build_payload(payload_type: str, length: int, extra: Optional[dict] = None) 
     """
     extra = extra or {}
     if payload_type == 'ipv4':
-        # 生成伪 IPv4 数据包（不保证为有效 IP 帧，仅用于占位）
+        # 生成有效的 IPv4 数据包，包含有效的 TCP 头
+        if length < 40:  # IP头(20) + TCP头(20)
+            length = 40
         version_ihl = 0x45
         tos = 0
-        total_length = length if length >= 20 else 20
-        ident = 0
-        flags_frag = 0
+        total_length = length  # IP 总长度
+        ident = random.randint(0, 65535)
+        flags_frag = 0x4000  # Don't Fragment
         ttl = 64
-        proto = extra.get('proto', 0)
-        checksum = 0
-        src_ip = extra.get('src_ip', b'\x0a\x00\x00\x01')
-        dst_ip = extra.get('dst_ip', b'\x0a\x00\x00\x02')
-        header = struct.pack('!BBHHHBBH4s4s', version_ihl, tos, total_length, ident, flags_frag, ttl, proto, checksum, src_ip, dst_ip)
-        body = os.urandom(max(0, length - len(header)))
-        return header + body
+        proto = extra.get('proto', 6)  # 默认 TCP
+        src_ip = extra.get('src_ip', bytes([10, random.randint(0, 255), random.randint(0, 255), random.randint(1, 254)]))
+        dst_ip = extra.get('dst_ip', bytes([10, random.randint(0, 255), random.randint(0, 255), random.randint(1, 254)]))
+        # 先用 checksum=0 构建头部，再计算校验和
+        header_no_cksum = struct.pack('!BBHHHBBH4s4s',
+                                      version_ihl, tos, total_length, ident, flags_frag,
+                                      ttl, proto, 0, src_ip, dst_ip)
+        checksum = _ip_checksum(header_no_cksum)
+        ip_header = struct.pack('!BBHHHBBH4s4s',
+                                version_ihl, tos, total_length, ident, flags_frag,
+                                ttl, proto, checksum, src_ip, dst_ip)
+        # 构建 TCP 头
+        tcp_data_len = max(0, length - 40)
+        tcp_header = _build_tcp_header(
+            random.randint(1024, 65535),
+            random.randint(1, 1023)
+        )
+        tcp_data = os.urandom(tcp_data_len)
+        return ip_header + tcp_header + tcp_data
     elif payload_type == 'ipv6':
-        payload_len = max(0, length - 40)
+        # 生成有效的 IPv6 数据包，包含有效的 TCP 头
+        if length < 60:  # IPv6头(40) + TCP头(20)
+            length = 60
+        payload_len = length - 40  # IPv6 净荷长度（不含 40 字节头部）
         ver_tc_flow = (6 << 28)
-        payload_proto = extra.get('proto', 0)
+        next_header = extra.get('proto', 6)  # 默认 TCP
         hop_limit = 64
         src = extra.get('src_ip', os.urandom(16))
         dst = extra.get('dst_ip', os.urandom(16))
-        header = struct.pack('!IHBB16s16s', ver_tc_flow, payload_len, payload_proto, hop_limit, src, dst)
-        return header + os.urandom(payload_len)
+        ipv6_header = struct.pack('!IHBB16s16s', ver_tc_flow, payload_len, next_header, hop_limit, src, dst)
+        # 构建 TCP 头
+        tcp_data_len = max(0, payload_len - 20)
+        tcp_header = _build_tcp_header(
+            random.randint(1024, 65535),
+            random.randint(1, 1023)
+        )
+        tcp_data = os.urandom(tcp_data_len)
+        return ipv6_header + tcp_header + tcp_data
     elif payload_type == 'arp':
         # Ethernet + IPv4 ARP packet (28 bytes) + padding
         htype = 1
@@ -206,46 +257,6 @@ def write_pcap(frames: Union[List[bytes], List[Tuple[int, int, bytes]]], filenam
             f.write(data)
 
 
-def read_pcap(filename: str) -> List[Tuple[int, int, bytes]]:
-    """从 pcap 文件读取帧，返回 (ts_sec, ts_usec, data) 列表。
-
-    仅支持常见 libpcap 小端/大端格式。
-    """
-    res = []
-    with open(filename, 'rb') as f:
-        raw_gh = f.read(24)
-        if len(raw_gh) < 24:
-            raise ValueError('不是有效的 pcap 文件')
-        magic = struct.unpack('<I', raw_gh[:4])[0]
-        if magic == PCAP_MAGIC_LE:
-            endian = '<'
-        elif magic == PCAP_MAGIC_BE:
-            endian = '>'
-        else:
-            # 也尝试大端读取
-            magic_be = struct.unpack('>I', raw_gh[:4])[0]
-            if magic_be == PCAP_MAGIC_LE:
-                endian = '<'
-            elif magic_be == PCAP_MAGIC_BE:
-                endian = '>'
-            else:
-                raise ValueError('未知 pcap magic')
-        # 我们不需要解析 global header 其他字段
-        # 从文件当前位置读取记录
-        while True:
-            ph = f.read(16)
-            if not ph:
-                break
-            if len(ph) < 16:
-                break
-            ts_sec, ts_usec, incl_len, orig_len = struct.unpack(endian + 'IIII', ph)
-            data = f.read(incl_len)
-            if len(data) < incl_len:
-                break
-            res.append((ts_sec, ts_usec, data))
-    return res
-
-
 def generate_frames(count: int = 1, payload: str = 'ipv4', payload_len: int = 100,
                     src_mac: Optional[str] = None, dst_mac: Optional[str] = None,
                     vlan: Optional[int] = None, qinq: Optional[int] = None,
@@ -264,24 +275,19 @@ def generate_frames(count: int = 1, payload: str = 'ipv4', payload_len: int = 10
 def _parse_args():
     p = argparse.ArgumentParser(description='Ethernet II 帧生成与 pcap I/O')
     p.add_argument('--count', '-c', type=int, default=10000, help='生成帧数')
-    p.add_argument('--payload', choices=['ipv4', 'ipv6', 'arp', 'mpls', 'raw'], default='ipv4')
+    p.add_argument('--payload', choices=['ipv4', 'ipv6', 'arp', 'mpls', 'raw'], default='arp')
     p.add_argument('--payload-len', type=int, default=100, help='净荷长度（字节）')
     p.add_argument('--src', type=str, default=None, help='源 MAC 地址，例如 00:11:22:33:44:55')
     p.add_argument('--dst', type=str, default=None, help='目标 MAC 地址')
     p.add_argument('--vlan', type=int, default=None, help='802.1Q VLAN ID (0-4095)')
     p.add_argument('--qinq', type=int, default=None, help='外层 QinQ VLAN ID')
-    p.add_argument('--out', type=str, default='out.pcap', help='输出 pcap 文件')
-    p.add_argument('--in', dest='infile', type=str, default=None, help='从 pcap 文件导入帧并显示计数')
+    p.add_argument('--out', type=str, default='EthernetII.pcap', help='输出 pcap 文件')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = _parse_args()
-    if args.infile:
-        frames = read_pcap(args.infile)
-        print(f'从 {args.infile} 读取到 {len(frames)} 帧')
-    else:
-        frames = generate_frames(count=args.count, payload=args.payload, payload_len=args.payload_len,
-                                 src_mac=args.src, dst_mac=args.dst, vlan=args.vlan, qinq=args.qinq)
-        write_pcap(frames, args.out)
-        print(f'已生成 {len(frames)} 帧并写入 {args.out}')
+    frames = generate_frames(count=args.count, payload=args.payload, payload_len=args.payload_len,
+                            src_mac=args.src, dst_mac=args.dst, vlan=args.vlan, qinq=args.qinq)
+    write_pcap(frames, args.out)
+    print(f'已生成 {len(frames)} 帧并写入 {args.out}')
